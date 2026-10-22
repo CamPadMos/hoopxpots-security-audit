@@ -1,0 +1,81 @@
+rules_version = '2';
+
+// HoopXpots — hardened Firestore rules (security audit, Oct 2026)
+// Principle: least privilege. Every write is checked against WHO is writing
+// and WHAT exactly they are allowed to change.
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ---------- helpers ----------
+    function signedIn() { return request.auth != null; }
+    function isSelf(uid) { return signedIn() && request.auth.uid == uid; }
+    function isAdmin() { return signedIn() && request.auth.token.admin == true; }
+    // True only if the write changes nothing except the listed fields
+    function onlyChanges(fields) {
+      return request.resource.data.diff(resource.data).affectedKeys().hasOnly(fields);
+    }
+
+    // ---------- COURTS ----------
+    // Public read. Admins manage courts. Signed-in users may only add +1
+    // to interestedCount (the "Notify me" button).
+    match /courts/{courtId} {
+      allow read: if true;
+      allow write: if isAdmin();
+      allow update: if signedIn()
+        && onlyChanges(['interestedCount'])
+        && request.resource.data.interestedCount == resource.data.get('interestedCount', 0) + 1;
+    }
+
+    // ---------- GAMES ----------
+    match /games/{gameId} {
+      allow read: if true;
+
+      // Creator must be the signed-in user and start as the only player.
+      allow create: if signedIn()
+        && request.resource.data.createdBy == request.auth.uid
+        && request.resource.data.players == [request.auth.uid]
+        && request.resource.data.playerCount == 1
+        && request.resource.data.maxPlayers in [6, 10];
+
+      // The creator can edit their game (but not hand it to someone else).
+      // Anyone else can ONLY join: add themselves once, +1 player, not over the limit.
+      allow update: if signedIn() && (
+        (resource.data.get('createdBy', '') == request.auth.uid
+          && request.resource.data.get('createdBy', '') == request.auth.uid)
+        ||
+        (onlyChanges(['players', 'playerCount'])
+          && !(request.auth.uid in resource.data.players)
+          && request.resource.data.players == resource.data.players.concat([request.auth.uid])
+          && request.resource.data.playerCount == resource.data.playerCount + 1
+          && request.resource.data.playerCount <= resource.data.maxPlayers)
+      );
+
+      allow delete: if signedIn() && resource.data.get('createdBy', '') == request.auth.uid;
+    }
+
+    // ---------- USERS ----------
+    // Private: contains email. Only the owner can read their own profile.
+    // Stats (elo, wins, losses, gamesPlayed) can't be edited from the app.
+    match /users/{userId} {
+      allow read: if isSelf(userId);
+      allow create: if isSelf(userId)
+        && request.resource.data.elo == 1000
+        && request.resource.data.wins == 0
+        && request.resource.data.losses == 0
+        && request.resource.data.gamesPlayed == 0;
+      allow update: if isSelf(userId)
+        && onlyChanges(['lastLogin', 'position', 'displayName', 'photoURL']);
+      allow delete: if false;
+    }
+
+    // ---------- NOT USED BY THE APP YET ----------
+    // Closed until a feature needs them (smaller attack surface).
+    // When you build one, open it with a check like:
+    //   request.resource.data.userId == request.auth.uid
+    match /notifications/{id} { allow read, write: if false; }
+    match /interested/{id}    { allow read, write: if false; }
+    match /gamePlayers/{id}   { allow read, write: if false; }
+    match /activity/{id}      { allow read, write: if false; }
+  }
+}
